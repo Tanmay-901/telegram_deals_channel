@@ -1,50 +1,70 @@
 /**
  * Sheets -> Telegram MULTI-CHANNEL pipeline
- * Light-Queue / Configuration-Dashboard / Historical-Archive architecture
+ * Light-Queue / Fast-Dedup / Configuration-Dashboard / Historical-Archive architecture
  * -------------------------------------------------------------------------
- * THREE TABS REQUIRED (exact names):
+ * REQUIRED TABS:
  *
  *   1. Live_Queue        — active, lightweight. Columns A-H:
  *        A: Product_Name | B: Raw_URL | C: Original_Price | D: Deal_Price
  *        E: Category (Gym / Pets / Vehicle) | F: Status (Pending / Error: ...)
  *        G: Coupon_Code (optional) | H: Percent_Off (optional)
  *      C/D (prices) OR H (percent) should be populated — NOT both required.
- *      A row with real/estimated prices posts as a price-comparison deal;
- *      a row with only a Percent_Off (and blank C/D) posts as a coupon-
- *      style message instead. See postQueueRow_ for the exact branching.
- *      NOTE: successfully-posted rows are DELETED from here and moved to
- *      Historical_Archive — Live_Queue never accumulates "Sent" rows.
+ *      NOTE: successfully-posted rowas are DELETED from here and moved to
+ *      Recent_Posted (active dedup window) — Live_Queue never accumulates "Sent" rows.
  *
- *   2. Configuration     — key/value dashboard. Column A = Key, B = Value.
+ *   2. Recent_Posted     — dedicated 4-hour deduplication sheet. Columns A-H:
+ *        A: Product_Name | B: Raw_URL | C: Original_Price | D: Deal_Price
+ *        E: Category | F: Sent_At | G: Coupon_Code | H: Percent_Off
+ *      Every posted deal lands here first. The dedup index ONLY checks Live_Queue +
+ *      Recent_Posted, keeping dedup lookups instant (<50ms). Rows older than
+ *      DEDUP_WINDOW_HOURS (default 4h) are moved to Historical_Archive by archiveRecentDeals.
+ *      (Auto-created by script if not present).
+ *
+ *   3. Configuration     — key/value dashboard. Column A = Key, B = Value.
  *      Row 1: headers (Key, Value)
- *      Row 2: POSTING_INTERVAL_MINUTES   e.g. 5
- *      Row 3: MAX_DEALS_PER_INTAKE_RUN   e.g. 2
- *      Row 4: IS_SALE_MODE_ACTIVE        TRUE or FALSE
- *      Row 5: LAST_POST_TIMESTAMP        (leave blank — script fills this in)
- *      Additional rows (LAST_INTAKE_RUN_TIMESTAMP, LAST_SWEEP_RUN_TIMESTAMP,
- *      LAST_ONEDIT_RUN_TIMESTAMP) are auto-created by the script the first
- *      time each trigger runs — you don't need to pre-add them.
+ *      Configurable Keys:
+ *        POSTING_INTERVAL_MINUTES      e.g. 5
+ *        MAX_DEALS_PER_INTAKE_RUN      e.g. 2
+ *        IS_SALE_MODE_ACTIVE           TRUE or FALSE
+ *        GYM_KEYWORDS                  e.g. ['whey', 'protein', 'gym'] or whey, protein, gym
+ *        PETS_KEYWORDS                 e.g. ['dog', 'cat', 'pet'] or dog, cat, pet
+ *        VEHICLE_KEYWORDS              e.g. ['car', 'bike', 'dashcam'] or car, bike, dashcam
+ *        DEDUP_WINDOW_HOURS            e.g. 4
+ *        LOG_RETENTION_HOURS           e.g. 24
+ *        LOG_MAX_ROWS                  e.g. 1000
+ *        ARCHIVE_RETENTION_DAYS        e.g. 30
+ *      Auto-updated Diagnostic Keys:
+ *        LAST_INTAKE_RESULT            (e.g. "Added 3 deal(s) (Gym: 2, Pets: 1, Vehicle: 0)")
+ *        CONSECUTIVE_ZERO_INTAKE_COUNT (increments on 0-deal runs; alerts at 3; resets on deal)
+ *        LAST_POST_TIMESTAMP
+ *        LAST_INTAKE_RUN_TIMESTAMP
+ *        LAST_SWEEP_RUN_TIMESTAMP
+ *        LAST_ARCHIVE_RUN_TIMESTAMP
+ *        LAST_MAINTENANCE_RUN_TIMESTAMP
  *
- *   3. Historical_Archive — permanent log of every deal ever posted.
+ *   4. Historical_Archive — permanent log of posted deals retained for ARCHIVE_RETENTION_DAYS.
  *      Columns A-H: Product_Name | Raw_URL | Original_Price | Deal_Price
  *      | Category | Sent_At | Coupon_Code | Percent_Off
- *      This is also the second half of the dedup index (Live_Queue +
- *      Historical_Archive Raw_URL columns = full de-dup history).
  *
- * SETUP:
- * 1. Create the three tabs above with exact names and header rows.
- * 2. Extensions > Apps Script, paste this file in as Code.gs.
+ *   5. Logs              — records errors and 3-consecutive-zero intake warnings.
+ *      Columns A-C: Timestamp | Context | Error
+ *      Auto-trimmed by runDailyMaintenance (>24 hours old or >1,000 rows).
+ *
+ * SETUP & TRIGGERS:
+ * 1. Create tabs with headers (or let the script auto-create Recent_Posted and Logs).
+ * 2. Extensions > Apps Script, paste this file in.
  * 3. Project Settings > Script Properties, add:
  *      BOT_TOKEN         = <your bot token from @BotFather>
  *      CHANNEL_GYM       = @YourGymChannel   (or numeric -100... id)
  *      CHANNEL_PETS      = @YourPetChannel
  *      CHANNEL_VEHICLE   = @YourVehicleChannel
  *      CUELINKS_API_KEY  = <your key from https://www.cuelinks.com/api-key>
- * 4. Run `createTrigger` once from the editor (grants permissions, installs
- *    the onEdit trigger).
- * 5. Set up TWO time-driven triggers manually (Triggers icon > Add Trigger):
- *      - sweepPendingRows -> every 1 minute is FINE now (see note below)
- *      - runAllIntakes    -> every 30-120 minutes (NOT 1 minute — see note)
+ * 4. Run `createTrigger` once from the editor (installs the onEdit trigger).
+ * 5. Set up 4 TIME-DRIVEN TRIGGERS manually (Triggers icon > Add Trigger):
+ *      - sweepPendingRows    -> Every 1 to 5 minutes
+ *      - runAllIntakes       -> Every 30 to 120 minutes
+ *      - archiveRecentDeals  -> Every 4 hours
+ *      - runDailyMaintenance -> Daily (between 4:00 AM - 5:00 AM)
  */
 
 // =====================================================================
@@ -52,8 +72,10 @@
 // =====================================================================
 
 const LIVE_QUEUE_SHEET = 'Live_Queue';
+const RECENT_POSTED_SHEET = 'Recent_Posted';
 const CONFIG_SHEET = 'Configuration';
 const ARCHIVE_SHEET = 'Historical_Archive';
+const LOGS_SHEET = 'Logs';
 const HEADER_ROW = 1;
 
 const COL = { NAME: 1, LINK: 2, ORIG: 3, DEAL: 4, CATEGORY: 5, STATUS: 6, COUPON_CODE: 7, PERCENT_OFF: 8 };
@@ -67,7 +89,22 @@ function getConfigSheet_() {
   return SpreadsheetApp.getActive().getSheetByName(CONFIG_SHEET);
 }
 function getArchiveSheet_() {
-  return SpreadsheetApp.getActive().getSheetByName(ARCHIVE_SHEET);
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(ARCHIVE_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(ARCHIVE_SHEET);
+    sheet.appendRow(['Product_Name', 'Raw_URL', 'Original_Price', 'Deal_Price', 'Category', 'Sent_At', 'Coupon_Code', 'Percent_Off']);
+  }
+  return sheet;
+}
+function getRecentPostedSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sheet = ss.getSheetByName(RECENT_POSTED_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(RECENT_POSTED_SHEET);
+    sheet.appendRow(['Product_Name', 'Raw_URL', 'Original_Price', 'Deal_Price', 'Category', 'Sent_At', 'Coupon_Code', 'Percent_Off']);
+  }
+  return sheet;
 }
 
 // =====================================================================
@@ -79,19 +116,20 @@ function getArchiveSheet_() {
 const CONFIG_DEFAULTS = {
   POSTING_INTERVAL_MINUTES: 5,
   MAX_DEALS_PER_INTAKE_RUN: 2,
-  IS_SALE_MODE_ACTIVE: false
+  IS_SALE_MODE_ACTIVE: false,
+  DEDUP_WINDOW_HOURS: 4,
+  LOG_RETENTION_HOURS: 24,
+  LOG_MAX_ROWS: 1000,
+  ARCHIVE_RETENTION_DAYS: 30
 };
 
-// Sale mode widens intake volume. Configuration only defines ONE
-// MAX_DEALS_PER_INTAKE_RUN value (no separate sale-mode number was
-// specified), so this multiplies the base value when sale mode is on.
-// Optional override: add a MAX_DEALS_PER_INTAKE_RUN_SALE row to the
-// Configuration tab for an exact number instead of a multiplier.
+// Sale mode widens intake volume. Multiplies base quota unless overridden.
 const SALE_MODE_INTAKE_MULTIPLIER = 7;
 
 /** Reads the whole Configuration tab into a plain {key: value} object. */
 function readConfig_() {
   const sheet = getConfigSheet_();
+  if (!sheet) return {};
   const lastRow = sheet.getLastRow();
   const map = {};
   if (lastRow <= HEADER_ROW) return map;
@@ -123,12 +161,11 @@ function getConfigDate_(config, key) {
 
 /**
  * Writes a single key's value. Updates the existing row if the key is
- * already present; otherwise self-heals by appending a new row — this is
- * how LAST_POST_TIMESTAMP, LAST_INTAKE_RUN_TIMESTAMP, etc. get created
- * automatically on first run without you having to pre-add them.
+ * already present; otherwise appends a new row automatically.
  */
 function setConfigValue_(key, value) {
   const sheet = getConfigSheet_();
+  if (!sheet) return;
   const lastRow = sheet.getLastRow();
   if (lastRow > HEADER_ROW) {
     const keys = sheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, 1).getValues();
@@ -144,7 +181,6 @@ function setConfigValue_(key, value) {
 
 /**
  * Per-category intake cap for this run, sourced from Configuration.
- * See SALE_MODE_INTAKE_MULTIPLIER note above for the sale-mode assumption.
  */
 function getIntakeQuota_(config) {
   const isSaleMode = getConfigBool_(config, 'IS_SALE_MODE_ACTIVE', CONFIG_DEFAULTS.IS_SALE_MODE_ACTIVE);
@@ -159,17 +195,18 @@ function getIntakeQuota_(config) {
 }
 
 // =====================================================================
-// DEDUPLICATION INDEX — Live_Queue + Historical_Archive, O(1) lookups
+// DEDUPLICATION INDEX — Live_Queue + Recent_Posted (fast O(1) lookups)
 // =====================================================================
 
 /**
- * Builds a single Set of every Raw_URL that exists anywhere in the
- * pipeline right now — currently queued (Live_Queue) OR ever posted
- * (Historical_Archive). One column-only read per sheet, no nested loops.
+ * Builds a single Set of every Raw_URL currently in Live_Queue OR Recent_Posted.
+ * Deals older than DEDUP_WINDOW_HOURS have moved to Historical_Archive and are
+ * deliberately excluded, allowing products to be posted again after the window expires.
  */
 function buildDedupIndex_() {
   const set = new Set();
-  [getLiveQueueSheet_(), getArchiveSheet_()].forEach(sheet => {
+  [getLiveQueueSheet_(), getRecentPostedSheet_()].forEach(sheet => {
+    if (!sheet) return;
     const lastRow = sheet.getLastRow();
     if (lastRow <= HEADER_ROW) return;
     const links = sheet.getRange(HEADER_ROW + 1, COL.LINK, lastRow - HEADER_ROW, 1).getValues();
@@ -201,16 +238,6 @@ const CATEGORY_KEYWORDS = {
   'Vehicle': ['car', 'bike', 'dashcam', 'tyre', 'helmet', 'lubricant', 'seat cover', 'automotive']
 };
 
-/**
- * Precompiled word-boundary regexes. Plain substring matching was
- * matching "cat" inside "category" and "car" inside "card" — \b
- * boundaries mean a keyword only matches as a standalone word.
- *
- * An optional trailing "s" is allowed before the closing boundary so
- * plurals still match ("dog" -> "dogs", "protein" -> "Proteins") without
- * reopening the substring-match bug: "category" still correctly fails
- * because "categor" isn't followed by a word-boundary after the "s?".
- */
 function buildCategoryRegexes_() {
   const map = {};
   for (const category in CATEGORY_KEYWORDS) {
@@ -231,14 +258,6 @@ function classifyCategory_(text) {
   return null;
 }
 
-/**
- * Fallback price extraction for offers with no structured original_price/
- * discount_price. Only succeeds when the text gives us BOTH a percent-off
- * figure AND a clear final/starting price ("only pay Rs. X", "starting at
- * Rs. X", "prices from Rs. X", "just Rs. X") — enough to back-calculate
- * original = deal / (1 - pct/100). Deliberately conservative: vaguer text
- * ("flat Rs. X off" with no base price) returns null rather than guessing.
- */
 function extractPriceFromText_(text) {
   const percentMatch = text.match(/(\d{1,3})\s*%\s*(?:off|discount|extra)?/i);
   if (!percentMatch) return null;
@@ -263,12 +282,6 @@ function extractPriceFromText_(text) {
   };
 }
 
-/**
- * Lighter fallback for the coupon-style message path: just grabs a
- * percent-off figure, with no requirement for an accompanying price
- * (unlike extractPriceFromText_, which needs both). Used only when the
- * stricter price extraction has already failed — this is Tier 3.
- */
 function extractPercentOff_(text) {
   const m = text.match(/(\d{1,3})\s*%\s*(?:off|discount|extra)?/i);
   if (!m) return null;
@@ -278,30 +291,31 @@ function extractPercentOff_(text) {
 }
 
 // =====================================================================
-// XML/RSS GENERIC INTAKE ENGINE — for EarnKaro / INRDeals if confirmed
+// XML/RSS GENERIC INTAKE ENGINE
 // =====================================================================
 
 const DEAL_SOURCES = [
   {
     name: 'EarnKaro',
-    enabled: false, // flip true once you've confirmed a real feed URL exists
+    enabled: false,
     feedUrl: 'PASTE_EARNKARO_FEED_URL_HERE_IF_CONFIRMED',
     tags: { itemNode: 'item', titleTag: 'title', linkTag: 'link', descriptionTag: 'description' }
   },
   {
     name: 'INRDeals',
-    enabled: false, // flip true once you've confirmed a real feed URL exists
+    enabled: false,
     feedUrl: 'PASTE_INRDEALS_FEED_URL_HERE_IF_CONFIRMED',
     tags: { itemNode: 'item', titleTag: 'title', linkTag: 'link', descriptionTag: 'description' }
   }
 ];
 
-function fetchDealsFromSource_(source, config) {
+function fetchDealsFromSource_(source, config, dedupSet) {
   const sheet = getLiveQueueSheet_();
+  dedupSet = dedupSet || buildDedupIndex_();
 
   if (!source.feedUrl || source.feedUrl.indexOf('PASTE_') === 0) {
     logError_(`fetchDealsFromSource_ (${source.name})`, new Error('feedUrl not configured'));
-    return;
+    return { total: 0, byCategory: { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 } };
   }
 
   let xmlText;
@@ -312,7 +326,7 @@ function fetchDealsFromSource_(source, config) {
     xmlText = response.getContentText();
   } catch (err) {
     logError_(`fetchDealsFromSource_ (${source.name}) fetch`, err);
-    return;
+    return { total: 0, byCategory: { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 } };
   }
 
   let items;
@@ -321,17 +335,17 @@ function fetchDealsFromSource_(source, config) {
     items = findAllDescendants_(document.getRootElement(), source.tags.itemNode);
   } catch (err) {
     logError_(`fetchDealsFromSource_ (${source.name}) parse`, err);
-    return;
+    return { total: 0, byCategory: { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 } };
   }
 
   if (!items || items.length === 0) {
-    logError_(`fetchDealsFromSource_ (${source.name})`, new Error('Feed parsed but returned 0 items — check tags.itemNode matches this feed'));
-    return;
+    logError_(`fetchDealsFromSource_ (${source.name})`, new Error('Feed parsed but returned 0 items'));
+    return { total: 0, byCategory: { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 } };
   }
 
-  const dedupSet = buildDedupIndex_();
   const quotaLimit = getIntakeQuota_(config);
   const quotaUsed = { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 };
+  const categoryRegexes = buildCategoryRegexes_(config);
   const rowsToAppend = [];
 
   for (const item of items) {
@@ -347,7 +361,7 @@ function fetchDealsFromSource_(source, config) {
       if (isDuplicateLink_(link, dedupSet)) continue;
 
       const haystack = `${title} ${description || ''}`.toLowerCase();
-      const category = classifyCategory_(haystack);
+      const category = classifyCategory_(haystack, categoryRegexes);
       if (!category) continue;
       if (quotaUsed[category] >= quotaLimit) continue;
 
@@ -365,7 +379,8 @@ function fetchDealsFromSource_(source, config) {
     sheet.getRange(startRow, 1, rowsToAppend.length, ROW_WIDTH).setValues(rowsToAppend);
   }
 
-  Logger.log(`fetchDealsFromSource_ (${source.name}): appended ${rowsToAppend.length} rows. Quota used: ${JSON.stringify(quotaUsed)} / limit ${quotaLimit}`);
+  Logger.log(`fetchDealsFromSource_ (${source.name}): appended ${rowsToAppend.length} rows.`);
+  return { total: rowsToAppend.length, byCategory: quotaUsed };
 }
 
 function findAllDescendants_(element, tagName) {
@@ -386,7 +401,7 @@ function getChildText_(itemElement, tagName) {
 }
 
 // =====================================================================
-// CUELINKS — real JSON REST intake (developers.cuelinks.com/pub_api/v3)
+// CUELINKS — real JSON REST intake
 // =====================================================================
 
 const CUELINKS_API_BASE = 'https://developers.cuelinks.com/pub_api/v3';
@@ -394,17 +409,26 @@ const CUELINKS_PAGE_SIZE = 100;
 const CUELINKS_MAX_PAGES = 10;
 
 /**
- * Runs Cuelinks + every enabled XML source. Wire THIS to your intake
- * time-driven trigger (recommended: every 30-120 min, NOT 1 minute —
- * unlike the posting side, every invocation of this one does real
- * paginated API work).
+ * Runs Cuelinks + every enabled XML source.
+ * Tracks total deals added, updates LAST_INTAKE_RESULT in Configuration,
+ * and logs an alert if 3 consecutive runs return 0 deals.
  */
 function runAllIntakes() {
   setConfigValue_('LAST_INTAKE_RUN_TIMESTAMP', new Date());
   const config = readConfig_();
+  const dedupSet = buildDedupIndex_();
+
+  let totalAdded = 0;
+  const categoryAdded = { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 };
 
   try {
-    fetchCuelinksOffers(config);
+    const cuelinksStats = fetchCuelinksOffers(config, dedupSet);
+    if (cuelinksStats) {
+      totalAdded += cuelinksStats.total;
+      for (const cat in cuelinksStats.byCategory) {
+        categoryAdded[cat] = (categoryAdded[cat] || 0) + cuelinksStats.byCategory[cat];
+      }
+    }
   } catch (err) {
     logError_('runAllIntakes (Cuelinks)', err);
   }
@@ -412,25 +436,50 @@ function runAllIntakes() {
   DEAL_SOURCES.forEach(source => {
     if (!source.enabled) return;
     try {
-      fetchDealsFromSource_(source, config);
+      const sourceStats = fetchDealsFromSource_(source, config, dedupSet);
+      if (sourceStats) {
+        totalAdded += sourceStats.total;
+        for (const cat in sourceStats.byCategory) {
+          categoryAdded[cat] = (categoryAdded[cat] || 0) + sourceStats.byCategory[cat];
+        }
+      }
     } catch (err) {
       logError_(`runAllIntakes (${source.name})`, err);
     }
   });
+
+  // Update diagnostic result in Configuration
+  let resultMsg = '';
+  if (totalAdded > 0) {
+    const breakdown = Object.keys(categoryAdded).map(c => `${c}: ${categoryAdded[c]}`).join(', ');
+    resultMsg = `Added ${totalAdded} deal(s) (${breakdown})`;
+    setConfigValue_('CONSECUTIVE_ZERO_INTAKE_COUNT', 0);
+  } else {
+    resultMsg = '0 deals added (quotas full or no matching keyword/unseen deals)';
+    const prevZeroCount = getConfigNumber_(config, 'CONSECUTIVE_ZERO_INTAKE_COUNT', 0);
+    const newZeroCount = prevZeroCount + 1;
+    setConfigValue_('CONSECUTIVE_ZERO_INTAKE_COUNT', newZeroCount);
+    if (newZeroCount === 3) {
+      logError_('runAllIntakes', new Error('3 consecutive intake runs returned 0 deals. Check API quota, token, or category filters.'));
+    }
+  }
+  setConfigValue_('LAST_INTAKE_RESULT', resultMsg);
+  Logger.log(`runAllIntakes: ${resultMsg}`);
 }
 
-function fetchCuelinksOffers(config) {
+function fetchCuelinksOffers(config, dedupSet) {
   const sheet = getLiveQueueSheet_();
+  dedupSet = dedupSet || buildDedupIndex_();
 
   const apiKey = PropertiesService.getScriptProperties().getProperty('CUELINKS_API_KEY');
   if (!apiKey) {
     logError_('fetchCuelinksOffers', new Error('CUELINKS_API_KEY not set in Script Properties'));
-    return;
+    return { total: 0, byCategory: { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 } };
   }
 
-  const dedupSet = buildDedupIndex_();
   const quotaLimit = getIntakeQuota_(config);
   const quotaUsed = { 'Gym': 0, 'Pets': 0, 'Vehicle': 0 };
+  const categoryRegexes = buildCategoryRegexes_(config);
   const rowsToAppend = [];
   let page = 1;
   let totalPages = 1;
@@ -488,24 +537,20 @@ function fetchCuelinksOffers(config) {
             deal = extracted.deal;
             isEstimated = true;
           } else {
-            // Tier 3: no derivable price at all — fall back to a
-            // coupon-style post if there's at least a percent-off to show
-            // (structured field first, then a lighter regex fallback that
-            // doesn't require an accompanying price like extractPriceFromText_ does).
             orig = '';
             deal = '';
             const structuredPct = offer.percent_off;
             percentOff = (structuredPct != null && !isNaN(Number(structuredPct)))
               ? Number(structuredPct)
               : extractPercentOff_(`${title} ${description}`);
-            if (percentOff == null && !couponCode) continue; // nothing worth posting
+            if (percentOff == null && !couponCode) continue;
           }
         }
 
         if (isDuplicateLink_(link, dedupSet)) continue;
 
         const haystack = `${title} ${description}`.toLowerCase();
-        const category = classifyCategory_(haystack);
+        const category = classifyCategory_(haystack, categoryRegexes);
         if (!category) continue;
         if (quotaUsed[category] >= quotaLimit) continue;
 
@@ -532,93 +577,79 @@ function fetchCuelinksOffers(config) {
     sheet.getRange(startRow, 1, rowsToAppend.length, ROW_WIDTH).setValues(rowsToAppend);
   }
 
-  Logger.log(`fetchCuelinksOffers: appended ${rowsToAppend.length} rows across ${page - 1} page(s). Quota used: ${JSON.stringify(quotaUsed)} / limit ${quotaLimit}`);
+  Logger.log(`fetchCuelinksOffers: appended ${rowsToAppend.length} rows.`);
+  return { total: rowsToAppend.length, byCategory: quotaUsed };
 }
 
 // =====================================================================
-// POSTING ENGINE — dynamic time-gating + move-on-success queue
+// POSTING ENGINE — gated queue + LockService + move to Recent_Posted
 // =====================================================================
 
-/**
- * Shared entry point for BOTH the onEdit trigger and the time-driven
- * sweep trigger. triggerLabel is used to record a per-trigger last-run
- * timestamp in Configuration (e.g. LAST_SWEEP_RUN_TIMESTAMP).
- *
- * Gating: if IS_SALE_MODE_ACTIVE is false and POSTING_INTERVAL_MINUTES
- * hasn't elapsed since LAST_POST_TIMESTAMP, this returns immediately —
- * no Live_Queue scan, no Telegram calls, no quota consumed beyond the
- * trigger invocation itself. Once the cooldown clears, it posts exactly
- * ONE row (oldest Pending first) and resets the cooldown.
- *
- * If IS_SALE_MODE_ACTIVE is true, gating is bypassed entirely and every
- * currently-Pending row (up to a safety cap) is posted in one run.
- */
 function processQueue_(triggerLabel) {
-  setConfigValue_(`LAST_${triggerLabel}_RUN_TIMESTAMP`, new Date());
-
-  const config = readConfig_();
-  const isSaleMode = getConfigBool_(config, 'IS_SALE_MODE_ACTIVE', CONFIG_DEFAULTS.IS_SALE_MODE_ACTIVE);
-  const intervalMinutes = getConfigNumber_(config, 'POSTING_INTERVAL_MINUTES', CONFIG_DEFAULTS.POSTING_INTERVAL_MINUTES);
-  const lastPost = getConfigDate_(config, 'LAST_POST_TIMESTAMP');
-
-  if (!isSaleMode && lastPost) {
-    const elapsedMs = Date.now() - lastPost.getTime();
-    const intervalMs = intervalMinutes * 60 * 1000;
-    if (elapsedMs < intervalMs) {
-      return; // cooldown still active — exit cleanly, no further work
-    }
-  }
-
-  const sheet = getLiveQueueSheet_();
-  const lastRow = sheet.getLastRow();
-  if (lastRow <= HEADER_ROW) return;
-
-  const values = sheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, ROW_WIDTH).getValues();
-  const pendingRowNumbers = [];
-  values.forEach((row, idx) => {
-    if (row[COL.STATUS - 1] === 'Pending') pendingRowNumbers.push(HEADER_ROW + 1 + idx);
-  });
-  if (pendingRowNumbers.length === 0) return;
-
-  if (!isSaleMode) {
-    const rowNum = pendingRowNumbers[0];
-    const rowValues = sheet.getRange(rowNum, 1, 1, ROW_WIDTH).getValues()[0];
-    const posted = postQueueRow_(sheet, rowNum, rowValues);
-    if (posted) setConfigValue_('LAST_POST_TIMESTAMP', new Date());
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log(`processQueue_ (${triggerLabel}): Lock unavailable, skipping concurrent execution.`);
     return;
   }
 
-  // Sale mode: burst-process all eligible rows (safety-capped), processing
-  // from the highest row number down so deleting a row never invalidates
-  // the row numbers of rows still waiting to be processed below it.
-  const SALE_MODE_BURST_CAP = 50;
-  const toProcess = pendingRowNumbers.slice(0, SALE_MODE_BURST_CAP).reverse();
-  let anyPosted = false;
+  try {
+    setConfigValue_(`LAST_${triggerLabel}_RUN_TIMESTAMP`, new Date());
 
-  toProcess.forEach(rowNum => {
-    const rowValues = sheet.getRange(rowNum, 1, 1, ROW_WIDTH).getValues()[0];
-    if (rowValues[COL.STATUS - 1] !== 'Pending') return; // safety re-check
-    const posted = postQueueRow_(sheet, rowNum, rowValues);
-    if (posted) anyPosted = true;
-  });
+    const config = readConfig_();
+    const isSaleMode = getConfigBool_(config, 'IS_SALE_MODE_ACTIVE', CONFIG_DEFAULTS.IS_SALE_MODE_ACTIVE);
+    const intervalMinutes = getConfigNumber_(config, 'POSTING_INTERVAL_MINUTES', CONFIG_DEFAULTS.POSTING_INTERVAL_MINUTES);
+    const lastPost = getConfigDate_(config, 'LAST_POST_TIMESTAMP');
 
-  if (anyPosted) setConfigValue_('LAST_POST_TIMESTAMP', new Date());
+    if (!isSaleMode && lastPost) {
+      const elapsedMs = Date.now() - lastPost.getTime();
+      const intervalMs = intervalMinutes * 60 * 1000;
+      if (elapsedMs < intervalMs) {
+        return; // cooldown active
+      }
+    }
+
+    const sheet = getLiveQueueSheet_();
+    if (!sheet) return;
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= HEADER_ROW) return;
+
+    const values = sheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, ROW_WIDTH).getValues();
+    const pendingRowNumbers = [];
+    values.forEach((row, idx) => {
+      if (row[COL.STATUS - 1] === 'Pending') pendingRowNumbers.push(HEADER_ROW + 1 + idx);
+    });
+    if (pendingRowNumbers.length === 0) return;
+
+    if (!isSaleMode) {
+      const rowNum = pendingRowNumbers[0];
+      const rowValues = sheet.getRange(rowNum, 1, 1, ROW_WIDTH).getValues()[0];
+      const posted = postQueueRow_(sheet, rowNum, rowValues);
+      if (posted) setConfigValue_('LAST_POST_TIMESTAMP', new Date());
+      return;
+    }
+
+    // Sale mode: burst-process rows, capped for timeout safety
+    const SALE_MODE_BURST_CAP = 25;
+    const toProcess = pendingRowNumbers.slice(0, SALE_MODE_BURST_CAP).reverse();
+    let anyPosted = false;
+
+    toProcess.forEach(rowNum => {
+      const rowValues = sheet.getRange(rowNum, 1, 1, ROW_WIDTH).getValues()[0];
+      if (rowValues[COL.STATUS - 1] !== 'Pending') return;
+      const posted = postQueueRow_(sheet, rowNum, rowValues);
+      if (posted) anyPosted = true;
+    });
+
+    if (anyPosted) setConfigValue_('LAST_POST_TIMESTAMP', new Date());
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 /**
- * Validates, formats, and sends ONE row. On success: appends it to
- * Historical_Archive and deletes it from Live_Queue (move-on-success —
- * Live_Queue never accumulates "Sent" rows). On failure: writes
- * "Error: <reason>" into the Status column in place, row stays put.
- * Returns true on success, false on failure.
- *
- * Two message shapes, chosen by what data the row actually has:
- *   - Original_Price + Deal_Price both present & valid -> price-comparison
- *     deal message (unchanged from before).
- *   - Neither present, but Percent_Off (and/or Coupon_Code) present ->
- *     coupon-style message instead. A row with NEITHER prices NOR a
- *     percent is a genuine data error (nothing worth posting), not a
- *     silently-skipped blank state.
+ * Validates and sends ONE row to Telegram.
+ * On success: appends it to Recent_Posted (active dedup window) and deletes it from Live_Queue.
+ * On failure: marks row with "Error: <reason>".
  */
 function postQueueRow_(sheet, rowNum, rowValues) {
   const [name, link, origPrice, dealPrice, category, , couponCode, percentOffRaw] = rowValues;
@@ -647,8 +678,6 @@ function postQueueRow_(sheet, rowNum, rowValues) {
     let message;
 
     if (hasOrig || hasDeal) {
-      // Partial price data (one filled, one blank) is a real data error —
-      // NOT the same as both intentionally blank for a coupon-style row.
       if (!hasOrig || !hasDeal) throw new Error('Original_Price and Deal_Price must both be set, or both left blank');
 
       const orig = Number(origPrice);
@@ -671,7 +700,7 @@ function postQueueRow_(sheet, rowNum, rowValues) {
     const result = sendToTelegram_(botToken, chatId, message, link);
     if (!result.ok) throw new Error(result.error);
 
-    appendToArchive_([
+    appendToRecentPosted_([
       name, link,
       hasOrig ? Number(origPrice) : '', hasDeal ? Number(dealPrice) : '',
       category, new Date(),
@@ -687,18 +716,11 @@ function postQueueRow_(sheet, rowNum, rowValues) {
   }
 }
 
-function appendToArchive_(rowValues) {
-  const sheet = getArchiveSheet_();
+function appendToRecentPosted_(rowValues) {
+  const sheet = getRecentPostedSheet_();
   sheet.getRange(sheet.getLastRow() + 1, 1, 1, rowValues.length).setValues([rowValues]);
 }
 
-/**
- * MarkdownV2 price-comparison message with dynamic category emoji,
- * strikethrough original price, and a Buy Now hyperlink embedded in the
- * text (not just the inline button) so Telegram still generates a link
- * preview image. Coupon code line included when present, same as the
- * coupon-style message below.
- */
 function buildDealMessage_(categoryConfig, name, orig, deal, savingsPct, link, couponCode) {
   const safeName = escapeMarkdownV2_(name);
   const origStr = escapeMarkdownV2_(`₹${orig.toLocaleString('en-IN')}`);
@@ -721,12 +743,6 @@ function buildDealMessage_(categoryConfig, name, orig, deal, savingsPct, link, c
   return lines.join('\n');
 }
 
-/**
- * Coupon-style message for offers with no derivable Original/Deal price —
- * shows percent-off (when known) and the coupon code (when known) instead
- * of a price comparison. Requires at least one of the two to be present
- * (enforced by the caller) so this never posts a bare, valueless message.
- */
 function buildCouponMessage_(categoryConfig, name, couponCode, percentOff, link) {
   const safeName = escapeMarkdownV2_(name);
   const safeLinkUrl = String(link).replace(/([)\\])/g, '\\$1');
@@ -750,11 +766,6 @@ function escapeMarkdownV2_(text) {
   return String(text).replace(/[_*\[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
-/**
- * Escapes only what's special INSIDE a MarkdownV2 code span (backtick and
- * backslash) — using the full escapeMarkdownV2_ here would wrongly show
- * literal backslashes in coupon codes containing "-" or other symbols.
- */
 function escapeMarkdownV2Code_(text) {
   return String(text).replace(/([`\\])/g, '\\$1');
 }
@@ -811,16 +822,168 @@ function sendToTelegram_(botToken, chatId, text, link) {
 }
 
 // =====================================================================
-// TRIGGERS
+// ARCHIVING & MAINTENANCE (4-Hour Recent Migration + Daily Maintenance)
 // =====================================================================
 
 /**
- * Both entry points funnel through the same gated processQueue_(), so
- * pacing is enforced identically no matter what fired the trigger. An
- * edit anywhere in Live_Queue attempts to post the oldest eligible row,
- * not necessarily the row you just edited — this keeps posting strictly
- * oldest-first and avoids two different code paths with different rules.
+ * Moves rows from Recent_Posted to Historical_Archive if they are older
+ * than DEDUP_WINDOW_HOURS (default 4 hours).
+ * Runs on a 4-hour time-driven trigger.
  */
+function archiveRecentDeals() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    Logger.log('archiveRecentDeals: Could not acquire lock, skipping.');
+    return;
+  }
+
+  try {
+    setConfigValue_('LAST_ARCHIVE_RUN_TIMESTAMP', new Date());
+    const config = readConfig_();
+    const windowHours = getConfigNumber_(config, 'DEDUP_WINDOW_HOURS', CONFIG_DEFAULTS.DEDUP_WINDOW_HOURS);
+    const cutoffTime = Date.now() - (windowHours * 60 * 60 * 1000);
+
+    const recentSheet = getRecentPostedSheet_();
+    const lastRow = recentSheet.getLastRow();
+    if (lastRow <= HEADER_ROW) return;
+
+    const values = recentSheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, ROW_WIDTH).getValues();
+    const stillRecent = [];
+    const toArchive = [];
+
+    values.forEach(row => {
+      const sentAtVal = row[ARCHIVE_COL.SENT_AT - 1];
+      const sentAtDate = (sentAtVal instanceof Date) ? sentAtVal : new Date(sentAtVal);
+      const isValidDate = !isNaN(sentAtDate.getTime());
+
+      if (isValidDate && sentAtDate.getTime() < cutoffTime) {
+        toArchive.push(row);
+      } else {
+        stillRecent.push(row);
+      }
+    });
+
+    if (toArchive.length === 0) {
+      Logger.log(`archiveRecentDeals: 0 rows older than ${windowHours}h to archive.`);
+      return;
+    }
+
+    // 1. Batch append expired rows to Historical_Archive
+    const archiveSheet = getArchiveSheet_();
+    const archiveStart = archiveSheet.getLastRow() + 1;
+    archiveSheet.getRange(archiveStart, 1, toArchive.length, ROW_WIDTH).setValues(toArchive);
+
+    // 2. Rewrite Recent_Posted with only active, unexpired rows
+    recentSheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, ROW_WIDTH).clearContent();
+    if (stillRecent.length > 0) {
+      recentSheet.getRange(HEADER_ROW + 1, 1, stillRecent.length, ROW_WIDTH).setValues(stillRecent);
+    }
+
+    Logger.log(`archiveRecentDeals: Moved ${toArchive.length} rows to Historical_Archive. ${stillRecent.length} rows remaining in Recent_Posted.`);
+  } catch (err) {
+    logError_('archiveRecentDeals', err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Daily early morning maintenance routine:
+ * 1. Purges Logs older than LOG_RETENTION_HOURS (default 24h) and caps total log rows at LOG_MAX_ROWS (default 1000).
+ * 2. Purges Historical_Archive entries older than ARCHIVE_RETENTION_DAYS (default 30 days).
+ * Runs on a daily time-driven trigger (e.g. 4:00 AM - 5:00 AM).
+ */
+function runDailyMaintenance() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    Logger.log('runDailyMaintenance: Could not acquire lock, skipping.');
+    return;
+  }
+
+  try {
+    setConfigValue_('LAST_MAINTENANCE_RUN_TIMESTAMP', new Date());
+    const config = readConfig_();
+
+    cleanLogs_(config);
+    cleanHistoricalArchive_(config);
+
+    Logger.log('runDailyMaintenance completed successfully.');
+  } catch (err) {
+    logError_('runDailyMaintenance', err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function cleanLogs_(config) {
+  const ss = SpreadsheetApp.getActive();
+  const logSheet = ss.getSheetByName(LOGS_SHEET);
+  if (!logSheet) return;
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow <= HEADER_ROW) return;
+
+  const retentionHours = getConfigNumber_(config, 'LOG_RETENTION_HOURS', CONFIG_DEFAULTS.LOG_RETENTION_HOURS);
+  const maxRows = getConfigNumber_(config, 'LOG_MAX_ROWS', CONFIG_DEFAULTS.LOG_MAX_ROWS);
+  const cutoffTime = Date.now() - (retentionHours * 60 * 60 * 1000);
+
+  const values = logSheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, 3).getValues();
+
+  // 1. Filter out entries older than retentionHours
+  let freshLogs = values.filter(row => {
+    const ts = (row[0] instanceof Date) ? row[0] : new Date(row[0]);
+    return !isNaN(ts.getTime()) && ts.getTime() >= cutoffTime;
+  });
+
+  // 2. Keep at most maxRows (latest)
+  if (freshLogs.length > maxRows) {
+    freshLogs = freshLogs.slice(freshLogs.length - maxRows);
+  }
+
+  // 3. Batch rewrite
+  logSheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, 3).clearContent();
+  if (freshLogs.length > 0) {
+    logSheet.getRange(HEADER_ROW + 1, 1, freshLogs.length, 3).setValues(freshLogs);
+  }
+
+  // 4. Shrink excess empty rows if sheet is bloated
+  const currentMax = logSheet.getMaxRows();
+  const targetRows = Math.max(freshLogs.length + HEADER_ROW + 10, 100);
+  if (currentMax > targetRows + 100) {
+    logSheet.deleteRows(targetRows + 1, currentMax - targetRows);
+  }
+}
+
+function cleanHistoricalArchive_(config) {
+  const archiveSheet = getArchiveSheet_();
+  if (!archiveSheet) return;
+
+  const lastRow = archiveSheet.getLastRow();
+  if (lastRow <= HEADER_ROW) return;
+
+  const retentionDays = getConfigNumber_(config, 'ARCHIVE_RETENTION_DAYS', CONFIG_DEFAULTS.ARCHIVE_RETENTION_DAYS);
+  const cutoffTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+
+  const values = archiveSheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, ROW_WIDTH).getValues();
+  const retainedRows = values.filter(row => {
+    const sentAtVal = row[ARCHIVE_COL.SENT_AT - 1];
+    const sentAt = (sentAtVal instanceof Date) ? sentAtVal : new Date(sentAtVal);
+    return isNaN(sentAt.getTime()) || sentAt.getTime() >= cutoffTime;
+  });
+
+  if (retainedRows.length !== values.length) {
+    archiveSheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, ROW_WIDTH).clearContent();
+    if (retainedRows.length > 0) {
+      archiveSheet.getRange(HEADER_ROW + 1, 1, retainedRows.length, ROW_WIDTH).setValues(retainedRows);
+    }
+    Logger.log(`cleanHistoricalArchive_: Purged ${values.length - retainedRows.length} rows older than ${retentionDays} days.`);
+  }
+}
+
+// =====================================================================
+// TRIGGERS & ERROR LOGGING
+// =====================================================================
+
 function onEditInstallable(e) {
   try {
     const sheet = e.range.getSheet();
@@ -841,10 +1004,7 @@ function sweepPendingRows() {
 }
 
 /**
- * One-time setup: installs the onEdit trigger. Time-driven triggers
- * (sweepPendingRows, runAllIntakes) are set up manually via the Triggers
- * UI so you can choose different intervals for each — see the note at
- * the top of this file for recommended intervals.
+ * One-time setup: installs the onEdit trigger.
  */
 function createTrigger() {
   const ss = SpreadsheetApp.getActive();
@@ -860,16 +1020,23 @@ function createTrigger() {
     .onEdit()
     .create();
 
-  Logger.log('onEdit trigger created. Set up sweepPendingRows and runAllIntakes as time-driven triggers manually via the Triggers UI.');
+  Logger.log('----------------------------------------------------');
+  Logger.log('SUCCESS: onEdit trigger installed.');
+  Logger.log('Now manually set up the 4 time-driven triggers:');
+  Logger.log('  1. sweepPendingRows    -> Time-driven (Minutes timer: every 1 to 5 min)');
+  Logger.log('  2. runAllIntakes       -> Time-driven (Minutes/Hour timer: every 30 to 120 min)');
+  Logger.log('  3. archiveRecentDeals  -> Time-driven (Hour timer: every 4 hours)');
+  Logger.log('  4. runDailyMaintenance -> Time-driven (Day timer: daily, 4:00 AM - 5:00 AM)');
+  Logger.log('----------------------------------------------------');
 }
 
 function logError_(context, err) {
   Logger.log(`[${context}] ${err.message}`);
   try {
     const ss = SpreadsheetApp.getActive();
-    let logSheet = ss.getSheetByName('Logs');
+    let logSheet = ss.getSheetByName(LOGS_SHEET);
     if (!logSheet) {
-      logSheet = ss.insertSheet('Logs');
+      logSheet = ss.insertSheet(LOGS_SHEET);
       logSheet.appendRow(['Timestamp', 'Context', 'Error']);
     }
     logSheet.appendRow([new Date(), context, err.message]);
