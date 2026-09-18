@@ -25,6 +25,34 @@ const LOGS_SHEET          = 'Logs';
 const HEADER_ROW          = 1;
 const ROW_WIDTH           = 8; // All deal sheets are A-H
 
+// ======================================================================
+// Execution-time monitoring (daily total runtime)
+// ======================================================================
+// Best-effort: if the “Configuration” sheet isn’t present, the script will
+// still track counters in PropertiesService, and will never break the
+// main pipeline.
+const CONFIG_MON_SHEET_NAME = 'Configuration';
+const CONFIG_DAILY_RUNTIME_CELL_A1 = 'B2';
+
+// Per-handler last runtime visualization.
+// (If you change handler function names, update this mapping.)
+const CONFIG_LAST_RUNTIME_CELL_BY_HANDLER = {
+  runAllIntakes: 'B3',
+  onEditInstallable: 'B4',
+  sweepPendingRows: 'B5'
+};
+
+// Throttle writes to the sheet to reduce overhead.
+const CONFIG_WRITE_MIN_INTERVAL_MS = 30 * 1000;
+
+// Where we store counters/state in PropertiesService
+const PROP_EXEC_DAILY_DATE = 'DAILY_EXEC_DATE';
+const PROP_EXEC_DAILY_TOTAL_MS = 'DAILY_EXEC_TOTAL_MS';
+const PROP_EXEC_LAST_WRITE_AT = 'CONFIG_LAST_WRITE_AT_EPOCH_MS';
+
+// For PropertiesService-only snapshots (optional; no dependency on sheet)
+const PROP_EXEC_LAST_RUNTIME_MS_PREFIX = 'LAST_RUNTIME_MS_';
+
 // Channels tab (1-based)
 const CH = {
   NAME:1, CHAT_ID:2, KEYWORDS:3, NEG_KEYWORDS:4,
@@ -43,6 +71,95 @@ const COL = {
 // ======================================================================
 
 function ss_() { return SpreadsheetApp.getActive(); }
+
+function msToHuman_(ms) {
+  ms = Number(ms) || 0;
+  const totalSeconds = Math.floor(ms / 1000);
+  const s = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const m = totalMinutes % 60;
+  const h = Math.floor(totalMinutes / 60);
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function epochMsToHuman_(epochMs) {
+  const n = Number(epochMs);
+  if (!isFinite(n) || n <= 0) return '';
+  return new Date(n).toLocaleString();
+}
+
+function getTodayKey_() {
+  const d = new Date();
+  // YYYY-MM-DD (local time)
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function recordExecutionRuntime_(handlerName, startEpochMs_) {
+  // Never allow monitoring to break the main deal pipeline.
+  try {
+    const start = Number(startEpochMs_);
+    if (!isFinite(start) || start <= 0) return;
+
+    const elapsedMs = Date.now() - start;
+    if (!isFinite(elapsedMs) || elapsedMs < 0) return;
+
+    const props = PropertiesService.getScriptProperties();
+    const lock = LockService.getScriptLock();
+    if (!lock.tryLock(20000)) return;
+
+    try {
+      const todayKey = getTodayKey_();
+
+      // Reset on first run after date changes
+      const lastResetDate = props.getProperty(PROP_EXEC_DAILY_DATE);
+      if (lastResetDate !== todayKey) {
+        props.setProperty(PROP_EXEC_DAILY_DATE, todayKey);
+        props.setProperty(PROP_EXEC_DAILY_TOTAL_MS, '0');
+      }
+
+      const prevTotalMs = Number(props.getProperty(PROP_EXEC_DAILY_TOTAL_MS) || '0');
+      const newTotalMs = prevTotalMs + elapsedMs;
+      props.setProperty(PROP_EXEC_DAILY_TOTAL_MS, String(newTotalMs));
+
+      // Best-effort store per-handler snapshot in properties (no required UI dependency)
+      props.setProperty(PROP_EXEC_LAST_RUNTIME_MS_PREFIX + handlerName, String(elapsedMs));
+
+      // Throttle sheet writes
+      const now = Date.now();
+      const lastWrite = Number(props.getProperty(PROP_EXEC_LAST_WRITE_AT) || '0');
+      if (now - lastWrite < CONFIG_WRITE_MIN_INTERVAL_MS) return;
+      props.setProperty(PROP_EXEC_LAST_WRITE_AT, String(now));
+
+      // Best-effort: update the Configurations tab cells (if present)
+      const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG_MON_SHEET_NAME);
+      if (!sheet) return;
+
+      // Daily total
+      sheet.getRange(CONFIG_DAILY_RUNTIME_CELL_A1).setValue(msToHuman_(newTotalMs));
+
+      // Per-handler last runtime
+      const cellA1 = (CONFIG_LAST_RUNTIME_CELL_BY_HANDLER && CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName])
+        ? CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName]
+        : null;
+
+      if (cellA1) {
+        const lastRunAtEpochMs = Date.now();
+        const prettyTime = epochMsToHuman_(lastRunAtEpochMs);
+        sheet.getRange(cellA1).setValue(`${msToHuman_(elapsedMs)} | ${prettyTime}`);
+      }
+
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (e) {
+    // swallow
+  }
+}
 
 function getOrCreateSheet_(name, headers) {
   let sheet = ss_().getSheetByName(name);
@@ -327,40 +444,45 @@ const CUELINKS_MAX_PAGES = 10;
  * Updates LAST_INTAKE_RESULT and manages consecutive-zero-intake alerting.
  */
 function runAllIntakes() {
-  setConfigValue_('LAST_INTAKE_RUN_TIMESTAMP', new Date());
-
-  const config   = readConfig_();
-  const channels = readChannels_();
-
-  if (channels.length === 0) {
-    setConfigValue_('LAST_INTAKE_RESULT', 'No enabled channels in Channels tab');
-    return;
-  }
-
-  const dedupSet   = buildDedupIndex_();
-  let   totalAdded = 0;
-
+  const __trackStart = Date.now();
   try {
-    const r = fetchCuelinksOffers_(channels, config, dedupSet);
-    totalAdded += r.total;
-  } catch (err) { logError_('runAllIntakes', err); }
+    setConfigValue_('LAST_INTAKE_RUN_TIMESTAMP', new Date());
 
-  let resultMsg;
-  if (totalAdded > 0) {
-    resultMsg = 'Added ' + totalAdded + ' queue row(s) across ' + channels.length + ' channel(s)';
-    setConfigValue_('CONSECUTIVE_ZERO_INTAKE_COUNT', 0);
-  } else {
-    resultMsg = '0 deals added (all duped, quota-full, or no keyword match)';
-    const prev = getConfigNumber_(config, 'CONSECUTIVE_ZERO_INTAKE_COUNT', 0);
-    const next  = prev + 1;
-    setConfigValue_('CONSECUTIVE_ZERO_INTAKE_COUNT', next);
-    if (next === 3) {
-      logError_('runAllIntakes',
-        new Error('3 consecutive zero-intake runs. Check API key, keywords, or channel quotas.'));
+    const config   = readConfig_();
+    const channels = readChannels_();
+
+    if (channels.length === 0) {
+      setConfigValue_('LAST_INTAKE_RESULT', 'No enabled channels in Channels tab');
+      return;
     }
+
+    const dedupSet   = buildDedupIndex_();
+    let   totalAdded = 0;
+
+    try {
+      const r = fetchCuelinksOffers_(channels, config, dedupSet);
+      totalAdded += r.total;
+    } catch (err) { logError_('runAllIntakes', err); }
+
+    let resultMsg;
+    if (totalAdded > 0) {
+      resultMsg = 'Added ' + totalAdded + ' queue row(s) across ' + channels.length + ' channel(s)';
+      setConfigValue_('CONSECUTIVE_ZERO_INTAKE_COUNT', 0);
+    } else {
+      resultMsg = '0 deals added (all duped, quota-full, or no keyword match)';
+      const prev = getConfigNumber_(config, 'CONSECUTIVE_ZERO_INTAKE_COUNT', 0);
+      const next  = prev + 1;
+      setConfigValue_('CONSECUTIVE_ZERO_INTAKE_COUNT', next);
+      if (next === 3) {
+        logError_('runAllIntakes',
+          new Error('3 consecutive zero-intake runs. Check API key, keywords, or channel quotas.'));
+      }
+    }
+    setConfigValue_('LAST_INTAKE_RESULT', resultMsg);
+    Logger.log('runAllIntakes: ' + resultMsg);
+  } finally {
+    recordExecutionRuntime_('runAllIntakes', __trackStart);
   }
-  setConfigValue_('LAST_INTAKE_RESULT', resultMsg);
-  Logger.log('runAllIntakes: ' + resultMsg);
 }
 
 function fetchCuelinksOffers_(channels, config, dedupSet) {
@@ -428,7 +550,7 @@ function fetchCuelinksOffers_(channels, config, dedupSet) {
 
         // 3-tier price extraction
         let orig = offer.original_price, deal = offer.discount_price;
-        let percentOff = '', isEstimated = false;
+        let percentOff = null, isEstimated = false;
 
         const hasRealPrices =
           orig != null && deal != null &&
@@ -445,6 +567,10 @@ function fetchCuelinksOffers_(channels, config, dedupSet) {
               ? Number(sp) : extractPercentOff_(title + ' ' + description);
           }
         }
+
+        // Normalize percentOff (sometimes extraction returns ''/undefined)
+        if (percentOff === '' || percentOff === undefined || percentOff === null) percentOff = null;
+        if (percentOff != null && (isNaN(Number(percentOff)) || Number(percentOff) <= 0)) percentOff = null;
 
         // Skip if nothing postable
         if (!hasRealPrices && !isEstimated && percentOff == null && !couponCode) continue;
@@ -464,7 +590,7 @@ function fetchCuelinksOffers_(channels, config, dedupSet) {
             orig === '' ? '' : Number(orig),
             deal === '' ? '' : Number(deal),
             ch.name, 'Pending', couponCode,
-            percentOff === '' || percentOff == null ? '' : Number(percentOff)
+            percentOff == null ? '' : Number(percentOff)
           ]);
           quotaUsed[ch.name] = (quotaUsed[ch.name] || 0) + 1;
           dedupSet.add(dedupKey_(link, ch.name));
@@ -561,7 +687,7 @@ function processQueue_(triggerLabel) {
  * Failure: marks Status cell as "Error: <reason>". Returns false.
  */
 function postQueueRow_(sheet, rowNum, rowValues, ch, botToken) {
-  const name       = rowValues[COL.NAME    - 1];
+  const rawName   = rowValues[COL.NAME    - 1];
   const link       = rowValues[COL.LINK    - 1];
   const origPrice  = rowValues[COL.ORIG    - 1];
   const dealPrice  = rowValues[COL.DEAL    - 1];
@@ -569,13 +695,24 @@ function postQueueRow_(sheet, rowNum, rowValues, ch, botToken) {
   const pctOffRaw  = rowValues[COL.PCT_OFF - 1];
 
   try {
-    if (!name || String(name).trim() === '#ERROR!') throw new Error('Missing or invalid Product_Name');
+    // Clean/sanitize Product_Name coming from Sheets (avoid null/empty/#ERROR issues)
+    let name = (rawName == null) ? '' : String(rawName);
+    name = name
+      .replace(/\uFEFF/g, '') // BOM
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!name || name.toUpperCase() === '#ERROR!') name = 'Deal';
+
     if (!link)      throw new Error('Missing Raw_URL');
     if (!ch.chatId) throw new Error('No Chat_ID for channel "' + ch.name + '"');
 
     const cleanCoupon = (couponCode && !/^(deal\s*activated|no\s*code\s*(required)?|not\s*required|none|na|n\/a)$/i.test(String(couponCode).trim()))
       ? String(couponCode).trim()
       : null;
+
+    // If we still don't have a usable name, allow posting to proceed rather than hard-failing.
+    // (We still include a generic label so Telegram text is valid.)
+    if (!name) name = 'Deal';
 
     const hasOrig   = origPrice  !== '' && origPrice  != null;
     const hasDeal   = dealPrice  !== '' && dealPrice  != null;
@@ -599,7 +736,9 @@ function postQueueRow_(sheet, rowNum, rowValues, ch, botToken) {
       message = buildCouponMessage_(ch, name, hasCoupon ? cleanCoupon : null, pct, link);
 
     } else {
-      throw new Error('No price, percent-off, or coupon code - nothing to post');
+      // Last-resort fallback: some Cuelinks deals may not expose prices/percent/codes
+      // (e.g. "DEAL ACTIVATED" / "No code required"). Still post the deal link.
+      message = buildNoPriceMessage_(ch, name, link);
     }
 
     const result = sendToTelegram_(botToken, ch.chatId, message, link);
@@ -665,6 +804,21 @@ function buildCouponMessage_(ch, name, couponCode, percentOff, link) {
   if (percentOff) lines.push('', '*' + escapeMarkdownV2_(percentOff + '% OFF') + '*');
   if (couponCode) lines.push('Code: `' + escapeMarkdownV2Code_(couponCode) + '`');
   lines.push('', '[Grab This Deal](' + safeLink + ')');
+  return lines.join('\n');
+}
+
+function buildNoPriceMessage_(ch, name, link) {
+  const safeName = escapeMarkdownV2_(name);
+  const safeLink = String(link).replace(/([)\\])/g, '\\$1');
+
+  const lines = [
+    ch.emoji + ' *' + escapeMarkdownV2_(ch.name) + '* ' + ch.emoji,
+    '',
+    '*' + safeName + '*',
+    '',
+    // No price/coupon provided; still provide the deal link.
+    '[Grab This Deal](' + safeLink + ')'
+  ];
   return lines.join('\n');
 }
 
@@ -818,20 +972,212 @@ function cleanHistoricalArchive_(config) {
 }
 
 // ======================================================================
+// WEB APP API ENDPOINT (for MCP proxy)
+// ======================================================================
+// Deploy this file as a Web App and call the URL with:
+//   ?token=YOUR_SECRET&action=something...
+//
+// SECURITY NOTE:
+// - This is a lightweight token-protected read-only endpoint.
+// - Store API_SECRET in Apps Script → Project Settings → Script Properties.
+
+const API_SECRET_PROP = 'API_SECRET';
+
+function doGet(e) {
+  try {
+    const params = (e && e.parameter) ? e.parameter : {};
+    const token = params.token;
+
+    const expected = PropertiesService.getScriptProperties().getProperty(API_SECRET_PROP);
+    if (!expected) {
+      return jsonResponse_({ ok: false, error: 'API_SECRET not set in Script Properties' }, 500);
+    }
+    if (!token || token !== expected) {
+      return jsonResponse_({ ok: false, error: 'unauthorized' }, 401);
+    }
+
+    const action = String(params.action || '').trim();
+    if (!action) {
+      return jsonResponse_({ ok: false, error: 'missing action' }, 400);
+    }
+
+    switch (action) {
+      case 'configurations_runtime': {
+        const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG_MON_SHEET_NAME);
+        // CONFIG_MON_SHEET_NAME is now aligned to your real tab name: 'Configuration'
+
+        const out = {
+          dailyTotal: null,
+          lastRun: {
+            runAllIntakes: null,
+            onEditInstallable: null,
+            sweepPendingRows: null
+          }
+        };
+
+        if (sheet) {
+          // B2, B3, B4, B5 by default. If layout changes, update constants.
+          const dailyCell = CONFIG_DAILY_RUNTIME_CELL_A1;
+          out.dailyTotal = sheet.getRange(dailyCell).getValue();
+
+          Object.keys(CONFIG_LAST_RUNTIME_CELL_BY_HANDLER || {}).forEach(handlerName => {
+            const cellA1 = CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName];
+            if (cellA1) out.lastRun[handlerName] = sheet.getRange(cellA1).getValue();
+          });
+        }
+
+        return jsonResponse_({ ok: true, data: out });
+      }
+
+      case 'list_sheets': {
+        const ss = SpreadsheetApp.getActive();
+        const sheets = ss.getSheets().map(s => ({
+          name: s.getName(),
+          lastRow: s.getLastRow(),
+          lastCol: s.getLastColumn()
+        }));
+        return jsonResponse_({ ok: true, data: { sheets } });
+      }
+
+      case 'sheet_audit': {
+        const required = [
+          CHANNELS_SHEET,
+          LIVE_QUEUE_SHEET,
+          RECENT_POSTED_SHEET,
+          CONFIG_SHEET,
+          ARCHIVE_SHEET,
+          LOGS_SHEET
+        ];
+        const ss = SpreadsheetApp.getActive();
+        const present = ss.getSheets().map(s => s.getName());
+
+        const missing = required.filter(r => !present.includes(r));
+        const extras = present.filter(p => !required.includes(p));
+
+        return jsonResponse_({
+          ok: true,
+          data: {
+            required,
+            present,
+            missing,
+            extras
+          }
+        });
+      }
+
+      case 'sheet_read': {
+        // Optional filters: allow returning values only (no writes). Server enforces caps.
+
+        const sheetName = String(params.sheet || '').trim();
+        if (!sheetName) return jsonResponse_({ ok: false, error: 'missing sheet parameter' }, 400);
+
+        // Soft guardrail: avoid extremely long/unexpected values.
+        // (We intentionally allow arbitrary sheet names since callers may need them.)
+        if (sheetName.length > 120) {
+          return jsonResponse_({ ok: false, error: 'sheet name too long' }, 400);
+        }
+
+        const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+        if (!sh) return jsonResponse_({ ok: false, error: 'sheet not found: ' + sheetName }, 404);
+
+        const lastRow = sh.getLastRow();
+        const lastCol = sh.getLastColumn();
+        if (lastRow < 1 || lastCol < 1) return jsonResponse_({ ok: true, data: { values: [] } });
+
+        const startCol = Math.max(1, Number(params.startCol || 1));
+        const pageSize = Number(params.pageSize || params.numRows || 200);
+        const numCols = params.numCols != null ? Number(params.numCols) : (lastCol - startCol + 1);
+        const maxPageSize = Number(params.maxPageSize || 1000);
+        const maxCells = Number(params.maxCells || 5000);
+
+        const safePageSize = Math.max(1, Math.min(maxPageSize, pageSize));
+        const safeNumCols = Math.max(1, Math.min(lastCol - startCol + 1, numCols));
+
+        // Support tail mode.
+        const tailNRaw = params.tailN;
+        let startRow;
+        if (tailNRaw != null && String(tailNRaw).trim() !== '') {
+          const tailN = Math.max(1, Math.min(maxPageSize, Number(tailNRaw) || safePageSize));
+          startRow = Math.max(1, lastRow - tailN + 1);
+        } else {
+          startRow = Math.max(1, Number(params.startRow || 1));
+        }
+
+        // Clip to sheet bounds.
+        if (startRow > lastRow) {
+          return jsonResponse_({ ok: true, data: { values: [] } });
+        }
+
+        const actualNumRows = Math.min(safePageSize, lastRow - startRow + 1);
+
+        const cellCount = actualNumRows * safeNumCols;
+        if (cellCount > maxCells) {
+          return jsonResponse_(
+            { ok: false, error: 'request too large', cellCount, maxCells },
+            413
+          );
+        }
+
+        const values = sh.getRange(startRow, startCol, actualNumRows, safeNumCols).getValues();
+
+        // JSON-safe conversion of Date objects.
+        const outVals = values.map(row => row.map(v => {
+          if (v instanceof Date) return v.toISOString();
+          return v;
+        }));
+
+        return jsonResponse_({
+          ok: true,
+          data: {
+            sheet: sheetName,
+            startRow,
+            startCol,
+            rowCount: actualNumRows,
+            colCount: safeNumCols,
+            values: outVals
+          }
+        });
+      }
+
+      default:
+        return jsonResponse_({ ok: false, error: 'unknown action: ' + action }, 400);
+    }
+  } catch (err) {
+    return jsonResponse_({ ok: false, error: String(err && err.message ? err.message : err) }, 500);
+  }
+}
+
+function jsonResponse_(obj, statusCode) {
+  const json = JSON.stringify(obj);
+  const out = ContentService.createTextOutput(json);
+  out.setMimeType(ContentService.MimeType.JSON);
+  // Apps Script doesn't reliably honor custom status codes for JSON, but this is fine.
+  return out;
+}
+
+// ======================================================================
 // TRIGGERS AND PUBLIC ENTRY POINTS
 // ======================================================================
 
 function onEditInstallable(e) {
+  const __trackStart = Date.now();
   try {
     if (e.range.getSheet().getName() !== LIVE_QUEUE_SHEET) return;
     if (e.range.getRow() <= HEADER_ROW) return;
     processQueue_('ONEDIT');
   } catch (err) { logError_('onEditInstallable', err); }
+  finally {
+    recordExecutionRuntime_('onEditInstallable', __trackStart);
+  }
 }
 
 function sweepPendingRows() {
+  const __trackStart = Date.now();
   try { processQueue_('SWEEP'); }
   catch (err) { logError_('sweepPendingRows', err); }
+  finally {
+    recordExecutionRuntime_('sweepPendingRows', __trackStart);
+  }
 }
 
 /** Run ONCE from the Apps Script editor to install the onEdit installable trigger. */
