@@ -42,6 +42,119 @@ const CONFIG_LAST_RUNTIME_CELL_BY_HANDLER = {
   sweepPendingRows: 'B5'
 };
 
+// Robust runtime storage: write runtime metrics as dedicated rows inside
+// the Configuration key/value table, so we never overwrite user config
+// (like DEDUP_WINDOW_HOURS).
+//
+// These keys are intentionally prefixed to minimize collision risk.
+const RUNTIME_KEY_DAILY_TOTAL = '__RUNTIME_DAILY_TOTAL__';
+const RUNTIME_LAST_RUN_KEY_PREFIX = '__RUNTIME_LAST_RUN_';
+
+function runtimeKeyForHandler_(handlerName) {
+  return RUNTIME_LAST_RUN_KEY_PREFIX + String(handlerName || '').trim() + '__';
+}
+
+function getConfigKeyCellValue_(sheet, row1Based) {
+  try {
+    return sheet.getRange(row1Based, 1).getValue();
+  } catch (_) {
+    return null;
+  }
+}
+
+// Reads Configuration tab value by matching the "Key" column.
+function getConfigValueByKey_(sheet, key) {
+  try {
+    const k = String(key || '').trim();
+    if (!k) return null;
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow <= HEADER_ROW) return null;
+
+    // A=Key, B=Value
+    const values = sheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, 2).getValues();
+    for (let i = 0; i < values.length; i++) {
+      const rowKey = String(values[i][0] || '').trim();
+      if (rowKey === k) return values[i][1];
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function setConfigValueByKey_(sheet, key, value, descriptionValue) {
+  try {
+    const k = String(key || '').trim();
+    if (!k) return;
+
+    const v = value;
+    const desc = descriptionValue != null ? descriptionValue : '';
+
+    const lastRow = sheet.getLastRow();
+    const hasDescription = sheet.getLastColumn && sheet.getLastColumn() >= 3;
+
+    // No data rows yet -> append.
+    if (lastRow <= HEADER_ROW) {
+      if (hasDescription) sheet.appendRow([k, v, desc]);
+      else sheet.appendRow([k, v]);
+      return;
+    }
+
+    // Scan existing keys.
+    const keys = sheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, 1).getValues();
+    for (let i = 0; i < keys.length; i++) {
+      const rowKey = String(keys[i][0] || '').trim();
+      if (rowKey === k) {
+        sheet.getRange(HEADER_ROW + 1 + i, 2).setValue(v);
+        if (hasDescription) sheet.getRange(HEADER_ROW + 1 + i, 3).setValue(desc);
+        return;
+      }
+    }
+
+    // Not found -> append.
+    if (hasDescription) sheet.appendRow([k, v, desc]);
+    else sheet.appendRow([k, v]);
+  } catch (_) {
+    // best-effort only
+  }
+}
+
+// Legacy fixed-cell writer: ONLY write if the sheet row "Key" matches
+// the expected runtime key.
+function maybeWriteLegacyRuntimeCell_(sheet, cellA1, expectedKey, value) {
+  try {
+    const a1 = String(cellA1 || '');
+    const m = a1.match(/^([A-Z]+)(\d+)$/i);
+    if (!m) return;
+
+    const row = Number(m[2]);
+    const col = columnNameToIndex_(m[1]);
+    if (!row || !col) return;
+
+    const rowKey = getConfigKeyCellValue_(sheet, row);
+    const expected = String(expectedKey || '').trim();
+    if (!expected) return;
+
+    if (String(rowKey || '').trim() !== expected) return;
+
+    sheet.getRange(row, col).setValue(value);
+  } catch (_) {
+    // best-effort only
+  }
+}
+
+function columnNameToIndex_(name) {
+  const s = String(name || '').trim().toUpperCase();
+  if (!s) return null;
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    n = n * 26 + (s.charCodeAt(i) - 64);
+  }
+  return n;
+}
+
+
 // Throttle writes to the sheet to reduce overhead.
 const CONFIG_WRITE_MIN_INTERVAL_MS = 30 * 1000;
 
@@ -139,18 +252,28 @@ function recordExecutionRuntime_(handlerName, startEpochMs_) {
       const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG_MON_SHEET_NAME);
       if (!sheet) return;
 
-      // Daily total
-      sheet.getRange(CONFIG_DAILY_RUNTIME_CELL_A1).setValue(msToHuman_(newTotalMs));
+      const dailyTotalStr = msToHuman_(newTotalMs);
+
+      // Robust write: dedicated runtime key row.
+      setConfigValueByKey_(sheet, RUNTIME_KEY_DAILY_TOTAL, dailyTotalStr, 'Daily total runtime');
+
+      // Legacy fixed-cell write (only if safe).
+      // We only write if the row's "Key" cell already contains our runtime key.
+      maybeWriteLegacyRuntimeCell_(sheet, CONFIG_DAILY_RUNTIME_CELL_A1, RUNTIME_KEY_DAILY_TOTAL, dailyTotalStr);
 
       // Per-handler last runtime
-      const cellA1 = (CONFIG_LAST_RUNTIME_CELL_BY_HANDLER && CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName])
+      const lastRunAtEpochMs = Date.now();
+      const prettyTime = epochMsToHuman_(lastRunAtEpochMs);
+      const perHandlerStr = `${msToHuman_(elapsedMs)} | ${prettyTime}`;
+
+      const runtimeKey = runtimeKeyForHandler_(handlerName);
+      setConfigValueByKey_(sheet, runtimeKey, perHandlerStr, 'Last runtime for handler');
+
+      const legacyCellA1 = (CONFIG_LAST_RUNTIME_CELL_BY_HANDLER && CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName])
         ? CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName]
         : null;
-
-      if (cellA1) {
-        const lastRunAtEpochMs = Date.now();
-        const prettyTime = epochMsToHuman_(lastRunAtEpochMs);
-        sheet.getRange(cellA1).setValue(`${msToHuman_(elapsedMs)} | ${prettyTime}`);
+      if (legacyCellA1) {
+        maybeWriteLegacyRuntimeCell_(sheet, legacyCellA1, runtimeKey, perHandlerStr);
       }
 
     } finally {
@@ -1003,6 +1126,13 @@ function doGet(e) {
 
     switch (action) {
       case 'configurations_runtime': {
+        // alias for backward compatibility
+        // (implementation below)
+
+        
+        // Read runtime + optionally full (capped) Configuration tab for AI context.
+        // includeAll=1 to return configuration values.
+      
         const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG_MON_SHEET_NAME);
         // CONFIG_MON_SHEET_NAME is now aligned to your real tab name: 'Configuration'
 
@@ -1016,16 +1146,121 @@ function doGet(e) {
         };
 
         if (sheet) {
-          // B2, B3, B4, B5 by default. If layout changes, update constants.
-          const dailyCell = CONFIG_DAILY_RUNTIME_CELL_A1;
-          out.dailyTotal = sheet.getRange(dailyCell).getValue();
+          // Primary: runtime keys stored inside the Configuration key/value table.
+          out.dailyTotal = getConfigValueByKey_(sheet, RUNTIME_KEY_DAILY_TOTAL);
 
           Object.keys(CONFIG_LAST_RUNTIME_CELL_BY_HANDLER || {}).forEach(handlerName => {
-            const cellA1 = CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName];
-            if (cellA1) out.lastRun[handlerName] = sheet.getRange(cellA1).getValue();
+            const runtimeKey = runtimeKeyForHandler_(handlerName);
+            out.lastRun[handlerName] = getConfigValueByKey_(sheet, runtimeKey);
           });
+
+          // Fallback: legacy fixed-cell addresses (only if they match our runtime keys).
+          if (out.dailyTotal == null) {
+            try {
+              const m = String(CONFIG_DAILY_RUNTIME_CELL_A1 || '').match(/^([A-Z]+)(\d+)$/i);
+              if (m) {
+                const row = Number(m[2]);
+                const rowKey = getConfigKeyCellValue_(sheet, row);
+                if (String(rowKey || '').trim() === RUNTIME_KEY_DAILY_TOTAL) {
+                  out.dailyTotal = sheet.getRange(CONFIG_DAILY_RUNTIME_CELL_A1).getValue();
+                }
+              }
+            } catch (_) {}
+          }
+
+          Object.keys(CONFIG_LAST_RUNTIME_CELL_BY_HANDLER || {}).forEach(handlerName => {
+            if (out.lastRun[handlerName] != null) return;
+            const cellA1 = CONFIG_LAST_RUNTIME_CELL_BY_HANDLER[handlerName];
+            if (!cellA1) return;
+            try {
+              const m = String(cellA1).match(/^([A-Z]+)(\d+)$/i);
+              if (!m) return;
+              const row = Number(m[2]);
+              const rowKey = getConfigKeyCellValue_(sheet, row);
+              if (String(rowKey || '').trim() === runtimeKeyForHandler_(handlerName)) {
+                out.lastRun[handlerName] = sheet.getRange(cellA1).getValue();
+              }
+            } catch (_) {}
+          });
+
+          // Optional: return configuration tab values for AI context.
+          // Usage:
+          //   ...&action=configurations_runtime&includeAll=1
+          //   ...&action=configurations_runtime&includeAll=1&startRow=1&pageSize=200&startCol=1&numCols=3&maxCells=5000
+          const includeAll = String(params.includeAll || '').toLowerCase();
+          if (['1', 'true', 'yes', 'y'].includes(includeAll)) {
+            const lastRow = sheet.getLastRow();
+            const lastCol = sheet.getLastColumn();
+
+            const startRow = Math.max(1, Number(params.startRow || 1));
+            const startCol = Math.max(1, Number(params.startCol || 1));
+            const pageSize = Number(params.pageSize || params.numRows || 200);
+            const numCols = params.numCols != null ? Number(params.numCols) : (lastCol - startCol + 1);
+            const maxCells = Number(params.maxCells || 5000);
+
+            const safeNumCols = Math.max(1, Math.min(lastCol - startCol + 1, numCols));
+            const safeNumRowsByPage = Math.max(1, Math.min(lastRow - startRow + 1, pageSize));
+            const maxRowsByCells = Math.max(1, Math.floor(maxCells / safeNumCols));
+            const safeNumRows = Math.max(1, Math.min(safeNumRowsByPage, maxRowsByCells));
+
+            const values = sheet
+              .getRange(startRow, startCol, safeNumRows, safeNumCols)
+              .getValues();
+
+            out.configuration = {
+              sheet: CONFIG_MON_SHEET_NAME,
+              startRow,
+              startCol,
+              rowCount: safeNumRows,
+              colCount: safeNumCols,
+              values
+            };
+
+            // Ensure small tabs return fully by default.
+            // Caller may still override with startRow/pageSize/maxCells for bigger tabs.
+            // (We cap by maxCells regardless.)
+          }
         }
 
+        return jsonResponse_({ ok: true, data: out });
+      }
+
+      case 'config_numeric_audit': {
+        const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG_MON_SHEET_NAME);
+        const keys = ['DEDUP_WINDOW_HOURS','LOG_RETENTION_HOURS','LOG_MAX_ROWS','ARCHIVE_RETENTION_DAYS'];
+        const items = keys.map(k => {
+          const raw = sheet ? getConfigValueByKey_(sheet, k) : null;
+          const asNumber = (raw === '' || raw == null) ? null : Number(raw);
+          const numeric = asNumber != null && isFinite(asNumber);
+          return { key: k, raw, numeric, asNumber: numeric ? asNumber : null };
+        });
+        return jsonResponse_({ ok: true, data: { sheet: CONFIG_MON_SHEET_NAME, items } });
+      }
+
+      case 'config_runtime_keys': {
+        const sheet = SpreadsheetApp.getActive().getSheetByName(CONFIG_MON_SHEET_NAME);
+        const runtimeKeys = [];
+        if (sheet) {
+          const lastRow = sheet.getLastRow();
+          if (lastRow > HEADER_ROW) {
+            const values = sheet.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, 2).getValues();
+            values.forEach(r => {
+              const rowKey = String(r[0] || '').trim();
+              if (!rowKey) return;
+              if (rowKey.startsWith('__RUNTIME_')) runtimeKeys.push({ key: rowKey, value: r[1] });
+            });
+          }
+        }
+        return jsonResponse_({ ok: true, data: { sheet: CONFIG_MON_SHEET_NAME, runtimeKeys } });
+      }
+
+      case 'deploy_info': {
+        // Helpful for clients to understand server-side constants and expected API behavior.
+        const out = {
+          configSheet: CONFIG_MON_SHEET_NAME,
+          dailyRuntimeCellA1: CONFIG_DAILY_RUNTIME_CELL_A1,
+          lastRuntimeCellByHandler: CONFIG_LAST_RUNTIME_CELL_BY_HANDLER
+        };
         return jsonResponse_({ ok: true, data: out });
       }
 
@@ -1085,9 +1320,14 @@ function doGet(e) {
         if (lastRow < 1 || lastCol < 1) return jsonResponse_({ ok: true, data: { values: [] } });
 
         const startCol = Math.max(1, Number(params.startCol || 1));
-        const pageSize = Number(params.pageSize || params.numRows || 200);
-        const numCols = params.numCols != null ? Number(params.numCols) : (lastCol - startCol + 1);
+        // Pagination behavior:
+        // - If callers don't specify pageSize/numRows, default to maxPageSize.
+        //   This means small tabs (rows <= maxPageSize) return fully in one call,
+        //   while larger tabs are capped/paginated.
         const maxPageSize = Number(params.maxPageSize || 1000);
+        const pageSize = Number(params.pageSize || params.numRows || maxPageSize);
+
+        const numCols = params.numCols != null ? Number(params.numCols) : (lastCol - startCol + 1);
         const maxCells = Number(params.maxCells || 5000);
 
         const safePageSize = Math.max(1, Math.min(maxPageSize, pageSize));
@@ -1100,6 +1340,7 @@ function doGet(e) {
           const tailN = Math.max(1, Math.min(maxPageSize, Number(tailNRaw) || safePageSize));
           startRow = Math.max(1, lastRow - tailN + 1);
         } else {
+          // Default behavior: if caller didn't request pagination, start at 1.
           startRow = Math.max(1, Number(params.startRow || 1));
         }
 

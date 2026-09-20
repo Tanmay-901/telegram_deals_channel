@@ -1,0 +1,4 @@
+# Prevent clasp from syncing extra/beta worktrees during push
+Beta/*
+.kilo/*
+node_modules/*

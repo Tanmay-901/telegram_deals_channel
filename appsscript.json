@@ -1,0 +1,10 @@
+{
+  "timeZone": "Asia/Kolkata",
+  "runtimeVersion": "V8",
+  "exceptionLogging": "STACKDRIVER",
+  "files": [
+    {
+      "name": "MAIN_telegram_deals_channel"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "telegram-deals-channel-apps-script",
+  "private": true,
+  "devDependencies": {
+    "@google/clasp": "^3.4.1"
+  },
+  "scripts": {
+    "clasp:status": "clasp status"
+  }
+}
