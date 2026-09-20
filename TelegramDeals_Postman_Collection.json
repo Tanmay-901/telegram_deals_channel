@@ -1,0 +1,116 @@
+{
+  "info": {
+    "name": "Telegram Deals Channel - WebApp API (TEST)",
+    "_postman_id": "7b5f5e1a-6b6c-4b62-9b3f-3e5f0d7a2c44",
+    "description": "Token-gated Apps Script Web App endpoints for configuration/runtime checks and sheet reads.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "config_numeric_audit",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}?action=config_numeric_audit&token={{token}}",
+          "host": ["{{baseUrl}}"],
+          "query": [
+            { "key": "action", "value": "config_numeric_audit" },
+            { "key": "token", "value": "{{token}}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "config_runtime_keys",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}?action=config_runtime_keys&token={{token}}",
+          "host": ["{{baseUrl}}"],
+          "query": [
+            { "key": "action", "value": "config_runtime_keys" },
+            { "key": "token", "value": "{{token}}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "configurations_runtime (includeAll=0)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}?action=configurations_runtime&includeAll=0&token={{token}}",
+          "host": ["{{baseUrl}}"],
+          "query": [
+            { "key": "action", "value": "configurations_runtime" },
+            { "key": "includeAll", "value": "0" },
+            { "key": "token", "value": "{{token}}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "configurations_runtime (includeAll=1 sample)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}?action=configurations_runtime&includeAll=1&startRow={{startRow}}&startCol={{startCol}}&pageSize={{pageSize}}&numCols={{numCols}}&maxCells={{maxCells}}&token={{token}}",
+          "host": ["{{baseUrl}}"],
+          "query": [
+            { "key": "action", "value": "configurations_runtime" },
+            { "key": "includeAll", "value": "1" },
+            { "key": "startRow", "value": "{{startRow}}" },
+            { "key": "startCol", "value": "{{startCol}}" },
+            { "key": "pageSize", "value": "{{pageSize}}" },
+            { "key": "numCols", "value": "{{numCols}}" },
+            { "key": "maxCells", "value": "{{maxCells}}" },
+            { "key": "token", "value": "{{token}}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "sheet_read (Historical_Archive tail)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}?action=sheet_read&sheet={{sheet}}&tailN={{tailN}}&startCol={{sheetStartCol}}&numCols={{sheetNumCols}}&token={{token}}",
+          "host": ["{{baseUrl}}"],
+          "query": [
+            { "key": "action", "value": "sheet_read" },
+            { "key": "sheet", "value": "{{sheet}}" },
+            { "key": "tailN", "value": "{{tailN}}" },
+            { "key": "startCol", "value": "{{sheetStartCol}}" },
+            { "key": "numCols", "value": "{{sheetNumCols}}" },
+            { "key": "token", "value": "{{token}}" }
+          ]
+        }
+      }
+    }
+  ],
+  "variables": [
+    { "key": "deploymentId", "value": "AKfycbwxtbHd1EnI-tqracUHf-HSD4AHyyRNKcqzSmBeQqCKQJFolzq0q0jyXepalv3bvTaqow" },
+    { "key": "token", "value": "TEST123456" },
+
+    {
+      "key": "baseUrl",
+      "value": "https://script.google.com/macros/s/{{deploymentId}}/exec"
+    },
+
+    { "key": "startRow", "value": "1" },
+    { "key": "startCol", "value": "1" },
+    { "key": "pageSize", "value": "20" },
+    { "key": "numCols", "value": "3" },
+    { "key": "maxCells", "value": "200" },
+
+    { "key": "sheet", "value": "Historical_Archive" },
+    { "key": "tailN", "value": "200" },
+    { "key": "sheetStartCol", "value": "1" },
+    { "key": "sheetNumCols", "value": "8" }
+  ]
+}
